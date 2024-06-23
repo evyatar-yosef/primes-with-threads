@@ -64,4 +64,3 @@ run: time ./randomGenerator 10 10000000 | ./myprime
 
 
 
-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
