@@ -4,8 +4,11 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <math.h>
 
-#define BATCH_SIZE 100
+
+struct LockFreeQueue queue;
+int prime_count = 0;
 
 // Original isPrime function
 // bool isPrime(int n) {
@@ -31,6 +34,7 @@ bool isPrime(int n) {
     if (n % 2 == 0 || n % 3 == 0) {
         return false;
     }
+    
     for (int i = 5; i * i <= n; i += 6) {
         if (n % i == 0 || n % (i + 2) == 0) {
             return false;
@@ -40,69 +44,80 @@ bool isPrime(int n) {
 }
 
 
-// Queue structure for batch processing
-typedef struct Queue {
-    int* data;
-    int capacity;
-    int front;
-    int rear;
-    int size;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-} Queue;
+typedef struct Node {
+    int value;
+    struct Node* next;
+} Node;
 
-Queue queue;
-atomic_int prime_count = 0;
-atomic_bool done = false;
+typedef struct LockFreeQueue{
+    Node* head;
+    Node* tail;
+}LockFreeQueue;
 
-void initQueue(Queue* q, int capacity) {
-    q->data = (int*)malloc(capacity * sizeof(int));
-    q->capacity = capacity;
-    q->front = 0;
-    q->rear = -1;
-    q->size = 0;
-    pthread_mutex_init(&q->mutex, NULL);
-    pthread_cond_init(&q->cond, NULL);
+void initQueue(LockFreeQueue* q) {
+    q = (struct LockFreeQueue*)malloc(sizeof(struct LockFreeQueue));
+    q->head = q->tail = NULL;
 }
 
-void destroyQueue(Queue* q) {
-    free(q->data);
-    pthread_mutex_destroy(&q->mutex);
-    pthread_cond_destroy(&q->cond);
+struct Node* createNewNode(int val)
+{
+    struct Node* temp = (struct Node*)malloc(sizeof(struct Node));
+    temp->value = val;
+    temp->next = NULL;
+    return temp;
 }
 
-void push(Queue* q, int value) {
-    pthread_mutex_lock(&q->mutex);
-    q->rear = (q->rear + 1) % q->capacity;
-    q->data[q->rear] = value;
-    q->size++;
-    pthread_cond_signal(&q->cond);
-    pthread_mutex_unlock(&q->mutex);
+void enqueue(LockFreeQueue* q, int value){
+    // Create a new LL node
+    struct Node* newNode = createNewNode(value);
+    struct Node* temp = (struct Node*)malloc(sizeof(struct Node));
+
+    do {
+        temp = q->tail;
+
+        if(__sync_bool_compare_and_swap(&q->tail, NULL, newNode)){ // If queue is empty, then new node is head and tail
+            q->head = newNode;
+            break;
+        }else if ( __sync_bool_compare_and_swap(&q->tail, temp, newNode)) {
+            temp->next=newNode;
+            break;
+        }
+    } while(1);
 }
 
-int popBatch(Queue* q, int* batch, int batch_size) {
-    pthread_mutex_lock(&q->mutex);
-    while (q->size == 0 && !done) {
-        pthread_cond_wait(&q->cond, &q->mutex);
+int dequeue(LockFreeQueue* q){
+    int val;
+    if(!q->head){
+        return -1;
     }
-    int count = 0;
-    while (q->size > 0 && count < batch_size) {
-        batch[count++] = q->data[q->front];
-        q->front = (q->front + 1) % q->capacity;
-        q->size--;
+
+    struct Node* temp;
+    do{
+        temp = q->head;
+        if(__sync_bool_compare_and_swap(&q->head, temp, q->head->next)){
+            val = temp->value;
+            if (q->head == NULL){
+                q->tail = NULL;
+            }
+            break;
+        }
+    } while(1);
+    free(temp);
+    return val;
+}
+
+void destroyQueue(LockFreeQueue* q) {
+    while(queue.head != NULL){
+        dequeue(q);
     }
-    pthread_mutex_unlock(&q->mutex);
-    return count;
 }
 
 void* primeCounter(void* arg) {
-    int batch[BATCH_SIZE];
-    while (!done || queue.size > 0) {
-        int count = popBatch(&queue, batch, BATCH_SIZE);
-        for (int i = 0; i < count; i++) {
-            if (isPrime(batch[i])) {
-                atomic_fetch_add(&prime_count, 1);
-            }
+    int val;
+    while ((val = dequeue(&queue)) != -1)
+    {
+        if(isPrime(val)){
+            __sync_add_and_fetch(&prime_count, 1);
         }
     }
     return NULL;
@@ -112,29 +127,29 @@ int main() {
     const int num_threads = sysconf(_SC_NPROCESSORS_ONLN);
     pthread_t threads[num_threads];
 
-    // Initialize the queue with a capacity of 10 times the batch size
-    initQueue(&queue, 10 * BATCH_SIZE);
+    // Initialize the queue
+    initQueue(&queue);
 
-    // Start prime counting threads
-    for (int i = 0; i < num_threads; ++i) {
-        pthread_create(&threads[i], NULL, primeCounter, NULL);
-    }
+
 
     // Read numbers from stdin and push them to the queue
     int num;
     while (scanf("%d", &num) != EOF) {
-        push(&queue, num);
+        enqueue(&queue, num);
     }
 
-    done = true;
-    pthread_cond_broadcast(&queue.cond);
+    // Start prime counting threads
+    for (int i = 0; i < num_threads; ++i) {
+        int t = pthread_create(&threads[i], NULL, primeCounter, NULL);
+    }
 
     // Join threads
     for (int i = 0; i < num_threads; ++i) {
         pthread_join(threads[i], NULL);
     }
 
-    printf("%d total primes.\n", atomic_load(&prime_count));
+    printf("%d total primes.\n", prime_count);
+    //, atomic_load(&prime_count)
 
     destroyQueue(&queue);
     return 0;
